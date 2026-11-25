@@ -1,0 +1,6 @@
+node_modules/
+data/
+bin/
+*.log
+mods/*/.claude-plugin/types/
+mods/*/tsconfig.json

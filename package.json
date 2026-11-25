@@ -1,0 +1,22 @@
+{
+  "name": "session-desk",
+  "version": "1.0.0",
+  "description": "One window for all your AI agent sessions and chats (Windows)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "demo": "node -e \"process.env.DESK_DEMO=1;require('./server.js')\""
+  },
+  "keywords": [],
+  "author": "",
+  "type": "commonjs",
+  "dependencies": {
+    "@lydell/node-pty": "^1.2.0-beta.18",
+    "@xterm/addon-fit": "^0.11.0",
+    "@xterm/addon-web-links": "^0.12.0",
+    "@xterm/addon-webgl": "^0.19.0",
+    "@xterm/xterm": "^6.0.0",
+    "ws": "^8.23.0"
+  },
+  "private": true
+}

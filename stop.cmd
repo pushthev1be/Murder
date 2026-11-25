@@ -1,0 +1,3 @@
+@echo off
+rem Stops Session Desk and every session running inside it. Embedded windows are handed back first.
+powershell -NoProfile -Command "$c = Get-NetTCPConnection -LocalPort 47821 -State Listen -ErrorAction SilentlyContinue; if ($c) { $p = Get-CimInstance Win32_Process -Filter ('ProcessId=' + $c.OwningProcess); if ($p.CommandLine -match 'server\.js') { try { Invoke-WebRequest -UseBasicParsing -Method Post http://127.0.0.1:47821/api/shutdown -Headers @{'X-Desk-Token'=(Get-Content '%~dp0data\token.txt')} -TimeoutSec 5 | Out-Null } catch {}; Start-Sleep 1; Stop-Process -Id $p.ProcessId -ErrorAction SilentlyContinue; 'Session Desk stopped.' } } else { 'Session Desk is not running.' }"
