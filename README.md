@@ -97,4 +97,8 @@ each). Scanning drops to every 15 s while the desk is hidden.
 **Next up**
 - One-click "Claude Code (remote control)" conversation kind
 - Hands-on testing of snapping across more apps and multi-monitor setups with different scaling
-- A license file
+
+## License
+
+MIT, see [LICENSE](LICENSE). `mods/desk-themes/hooks/make-colors.*` is a helper copied from Claude Code's
+mod-authoring kit (mods are meant to ship a copy of it) and isn't covered by this license.
