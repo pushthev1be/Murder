@@ -18,7 +18,7 @@ const { chromium } = require('playwright');
 
 const ROOT = path.join(__dirname, '..');
 const SHIM = path.join(__dirname, 'shim');
-let nextPort = 47900;
+let nextPort = 48000 + Math.floor(Math.random() * 400) * 40; // separate runs never share ports
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 // ---------- a desk server ----------
@@ -877,6 +877,68 @@ fakeTest('snap: on a zoomed screen (150%) the window still matches its pane', as
   const it = docked(l, 1001), r = await bodyRect(p, 'x-win-1001');
   assert(r.dpr === 1.5, 'zoom not applied');
   assert(Math.abs(it.w - r.w * 1.5) <= 1 && Math.abs(it.x - r.x * 1.5) <= 1, `scaled wrong: ${JSON.stringify(it)} vs ${JSON.stringify(r)}`);
+});
+
+// ---------- round 5: double starts, offline removal, scale, leaks ----------
+test('start.cmd twice: the second start leaves the running desk alone', async ({ desk }) => {
+  await startShell(desk, 'a');
+  const twin = new Desk(); twin.port = desk.port; twin.data = desk.data;
+  const env = { ...process.env, DESK_DEMO: '1', DESK_DATA: desk.data, DESK_PORT: String(desk.port), PATH: SHIM + path.delimiter + process.env.PATH };
+  const proc = spawn(process.execPath, ['server.js', '--no-open'], { cwd: ROOT, env });
+  let out = ''; proc.stdout.on('data', d => out += d); proc.stderr.on('data', d => out += d);
+  const code = await Promise.race([new Promise(r => proc.on('exit', r)), sleep(5000).then(() => 'still running')]);
+  if (code === 'still running') proc.kill('SIGKILL');
+  assert(code === 0, 'second start did not step aside: ' + code + ' ' + out.slice(-300));
+  const st = await desk.state();
+  assert(running(st.statuses.a), 'the running desk lost its session');
+  const ran = JSON.parse(fs.readFileSync(path.join(desk.data, 'running.json'), 'utf8'));
+  assert(ran.includes('a'), 'the second start erased the list of running sessions');
+});
+
+test('a removal made while the desk is down still happens when it is back', async ({ desk, browser }) => {
+  const p = await page(browser, desk);
+  await addShell(p); await addShell(p);
+  const [a, b] = await sessionIds(desk);
+  await desk.kill();
+  await p.click(`.item[data-sid="${a}"]`, { button: 'right' }); await p.click('#menu .mi >> text=Remove from desk');
+  await sleep(500);
+  await desk.start(); await sleep(4500);
+  const st = await desk.state();
+  assert(!st.state.sessions.some(s => s.id === a), 'removed session is back');
+  assert(!running(st.statuses[a]), 'removed session was resumed');
+  assert(running(st.statuses[b]), 'the other session did not resume');
+});
+
+fakeTest('scale: a hundred outside windows', async ({ desk, browser }) => {
+  const windows = [], procs = [];
+  for (let i = 0; i < 100; i++) { windows.push({ hwnd: 5000 + i, pid: 900 + i, title: `Chat ${i} - ChatGPT`, min: false }); procs.push([900 + i, 1, 'ChatGPT.exe']); }
+  desk.setWindows({ windows, procs });
+  const p = await page(browser, desk); await sleep(3800);
+  assert(await p.locator('#sessionList .item').count() === 100, 'not all listed');
+  const t0 = Date.now(); await p.click('#btnTile'); await sleep(200);
+  const took = Date.now() - t0;
+  const n = await p.locator('#layoutRoot .pane').count();
+  const sizes = await p.$$eval('.pane', els => els.map(e => [Math.round(e.getBoundingClientRect().width), Math.round(e.getBoundingClientRect().height)]));
+  assert(took < 2000, 'Arrange all took ' + took + 'ms');
+  assert(n > 0 && sizes.every(([w, h]) => w >= 299 && h >= 199), `${n} panes, sizes ${JSON.stringify(sizes.slice(0, 5))}`);
+  assert(!p.errors.length, p.errors.join('; '));
+});
+
+test('leaks: hundreds of re-renders leave no extra terminals or nodes behind', async ({ desk, browser }) => {
+  const a = await page(browser, desk), b = await page(browser, desk);
+  await addShell(a); await addShell(a); await addShell(a);
+  await sleep(800);
+  const count = () => a.evaluate(() => ({ nodes: document.getElementsByTagName('*').length, xterms: document.querySelectorAll('.xterm').length }));
+  const before = await count();
+  for (let i = 0; i < 120; i++) await b.evaluate(g => document.querySelector(`.swatch[data-ground=${g}]`).click(), i % 2 ? 'milk' : 'sand');
+  await sleep(1500);
+  for (let i = 0; i < 20; i++) { await a.click('#btnParkAll'); await sleep(60); await a.click('#btnTile'); await sleep(120); }
+  await sleep(1500);
+  const after = await count();
+  assert(after.xterms === 3, 'terminals on the page: ' + after.xterms);
+  assert(after.nodes < before.nodes * 1.3 + 200, `DOM grew from ${before.nodes} to ${after.nodes} nodes`);
+  const st = await desk.state();
+  assert(st.state.sessions.every(s => running(st.statuses[s.id])), 'something stopped');
 });
 
 // ---------- runner ----------
