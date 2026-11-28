@@ -57,12 +57,13 @@ const paneEls = new Map();   // sid -> pane element (kept across re-renders)
 // ---------- server sync ----------
 let saveTimer = null;
 const removedQueue = new Set(); // conversations you removed: the server stops them on the next save
+let unsaved = false;           // a save failed (desk unreachable): retried on reconnect
 function saveNow() {
   clearTimeout(saveTimer); saveTimer = null;
   const removed = [...removedQueue];
   return fetch('/api/state?client=' + CLIENT, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...state, removed }) })
-    .then(r => { if (r.ok) removed.forEach(id => removedQueue.delete(id)); })
-    .catch(() => toast('Could not save layout'));
+    .then(r => { if (!r.ok) throw new Error(r.status); removed.forEach(id => removedQueue.delete(id)); unsaved = false; })
+    .catch(() => { unsaved = true; });
 }
 function save() {
   clearTimeout(saveTimer);
@@ -73,11 +74,23 @@ function commit() { save(); render(); }
 let ws = null, wsBackoff = 500;
 function connect() {
   ws = new WebSocket(`ws://${location.host}/ws`);
-  ws.onopen = () => { wsBackoff = 500; for (const sid of terms.keys()) attach(sid); if (document.hasFocus()) send({ t: 'claim' }); lastDockPayload = ''; syncDock(); };
+  ws.onopen = () => {
+    wsBackoff = 500;
+    // anything done while the desk was unreachable (a new conversation, a removal) goes through now
+    if (unsaved || pendingStarts.length) saveNow().then(() => pendingStarts.splice(0).forEach(m => send(m)));
+    for (const sid of terms.keys()) attach(sid);
+    if (document.hasFocus()) send({ t: 'claim' });
+    lastDockPayload = ''; syncDock();
+  };
   ws.onmessage = ev => onMsg(JSON.parse(ev.data));
   ws.onclose = () => { setTimeout(connect, wsBackoff); wsBackoff = Math.min(wsBackoff * 2, 2500); };
 }
 function send(msg) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(msg)); }
+const pendingStarts = []; // starts asked for while the desk was unreachable
+function sendStart(msg) {
+  if (ws && ws.readyState === 1 && !unsaved) send(msg);
+  else { pendingStarts.push(msg); toast('The desk is reconnecting. This starts as soon as it is back.'); }
+}
 
 function onMsg(m) {
   switch (m.t) {
@@ -110,7 +123,13 @@ function onMsg(m) {
       renderStatusBits(m.id);
       break;
     case 'state':
-      if (m.from !== CLIENT) { state = m.state; ensureStateShape(); applyGround(state.ground); render(); }
+      if (m.from !== CLIENT) {
+        // keep what this window did that the desk hasn't heard yet: removals, and anything not saved
+        const mine = unsaved ? state.sessions.filter(s => !m.state.sessions.some(o => o.id === s.id)) : [];
+        state = m.state;
+        state.sessions = state.sessions.filter(s => !removedQueue.has(s.id)).concat(mine);
+        ensureStateShape(); applyGround(state.ground); render();
+      }
       break;
     case 'hello':
       if (window.__build && window.__build !== m.build) location.reload(); // the desk was updated
@@ -305,7 +324,7 @@ function startSess(sid, resume = false, restart = false) {
   const t = terms.get(sid);
   const dims = t ? t.fit.proposeDimensions() : null;
   // make sure the server knows about this session before asking it to start
-  saveNow().then(() => send({ t: 'start', id: sid, resume, restart, cols: dims?.cols || 100, rows: dims?.rows || 30 }));
+  saveNow().then(() => sendStart({ t: 'start', id: sid, resume, restart, cols: dims?.cols || 100, rows: dims?.rows || 30 }));
   if (t) { t.term.reset(); t.alive = true; t.cols = t.rows = 0; updateOverlay(sid); setTimeout(() => { fitTerm(sid); t.term.focus(); }, 50); }
 }
 function removeSession(sid) {
@@ -479,7 +498,7 @@ function ensureTerm(sid, host) {
     if (e.ctrlKey && e.shiftKey && (e.key === 'C' || e.key === 'c') && term.hasSelection()) { navigator.clipboard.writeText(term.getSelection()); return false; }
     if (e.ctrlKey && e.shiftKey && (e.key === 'V' || e.key === 'v')) { navigator.clipboard.readText().then(x => term.paste(x)); return false; }
     if (e.ctrlKey && e.key === 'c' && term.hasSelection()) { navigator.clipboard.writeText(term.getSelection()); term.clearSelection(); return false; }
-    if (globalShortcut(e)) return false;
+    if (globalShortcut(e)) { e.preventDefault(); e.stopPropagation(); return false; } // handled once, not again by the page
     return true;
   });
   t = { term, fit, el, host, cols: 0, rows: 0, alive: statuses[sid] && statuses[sid] !== 'stopped' };
@@ -684,11 +703,18 @@ function renderStage() {
   // drop panes for outside windows we no longer know anything about (e.g. closed before a restart)
   // (only once discovery has reported, so a just-started desk doesn't drop them all)
   if (discovered.length) for (const sid of onScreen()) if (isExt(sid) && !info(sid)) removeFromTree(sid);
+  // and panes for conversations that were removed (e.g. in another desk window): no empty holes
+  for (const sid of onScreen()) if (!isExt(sid) && !session(sid)) removeFromTree(sid);
   const on = onScreen();
   // dispose terminals whose panes left the screen (e.g. changed in another window)
   for (const sid of [...terms.keys()]) if (!on.includes(sid) || !session(sid)) disposeTerm(sid);
   for (const sid of [...paneEls.keys()]) if (!on.includes(sid)) paneEls.delete(sid);
 
+  // Panes are re-attached, not rebuilt, but taking them out of the page for a moment drops the
+  // keyboard and scroll positions. Re-renders happen whenever another desk window saves or an app
+  // window changes its title, so without this you'd lose keystrokes mid-sentence.
+  const active = document.activeElement;
+  const scrolls = [...root.querySelectorAll('.tx, textarea, .xterm-viewport')].map(el => [el, el.scrollTop]);
   root.innerHTML = '';
   $('#emptyState').classList.toggle('hidden', on.length > 0);
   $('#stageTitle').textContent = state.maximized ? 'Focused' : 'On screen';
@@ -699,6 +725,8 @@ function renderStage() {
     state.maximized = null;
     root.append(cellFor(state.layout));
   }
+  for (const [el, top] of scrolls) if (el.isConnected && el.scrollTop !== top) el.scrollTop = top;
+  if (active && active !== document.body && active.isConnected && document.activeElement !== active) active.focus({ preventScroll: true });
   requestAnimationFrame(() => { for (const sid of terms.keys()) fitTerm(sid); });
   syncDock();
 }
@@ -1054,7 +1082,7 @@ function currentProject() {
 }
 function createSession({ provider, projectId, title, cwd, command, url }) {
   const s = {
-    id: uid('s'), title: title || autoTitle(provider), provider, projectId,
+    id: uid('s'), title: title || autoTitle(provider), autoTitle: !title, provider, projectId,
     cwd: provider === 'web' ? null : (cwd || null), command: provider === 'custom' ? command : null,
     url: provider === 'web' ? url : null, createdAt: Date.now(),
   };

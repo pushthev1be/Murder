@@ -1,0 +1,10 @@
+#!/bin/bash
+# Test-only stand-in for powershell.exe on Linux: runs -Command with bash, then stays in a shell.
+cmd=""; while [ $# -gt 0 ]; do [ "$1" = "-Command" ] && { cmd="$2"; shift; }; shift; done
+export PS1='desk$ '
+# like PowerShell, "exit" in -Command ends the process even with -NoExit
+case "$cmd" in
+  exit|"exit "*) eval "$cmd" ;;
+esac
+if [ -n "$cmd" ]; then bash -c "$cmd"; fi
+exec bash --norc --noprofile -i

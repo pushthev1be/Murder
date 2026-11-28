@@ -38,8 +38,19 @@ const DEFAULT_STATE = {
   drafts: {},         // session id -> notes text for web sessions
 };
 function loadState() {
-  try { return { ...DEFAULT_STATE, ...JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')) }; }
-  catch { return structuredClone(DEFAULT_STATE); }
+  let text;
+  try { text = fs.readFileSync(STATE_FILE, 'utf8'); } catch { return structuredClone(DEFAULT_STATE); } // first run
+  try {
+    const s = { ...DEFAULT_STATE, ...JSON.parse(text) };
+    if (Array.isArray(s.projects) && s.projects.length && Array.isArray(s.sessions)) return s;
+    throw new Error('unexpected shape');
+  } catch (err) {
+    // keep the damaged file so nothing is lost for good, and start with a clean desk
+    const keep = `${STATE_FILE}.broken-${Date.now()}`;
+    try { fs.copyFileSync(STATE_FILE, keep); } catch {}
+    console.error(`[state] ${path.basename(STATE_FILE)} could not be read (${err.message}); kept a copy as ${path.basename(keep)}`);
+    return structuredClone(DEFAULT_STATE);
+  }
 }
 let state = loadState();
 function saveState() {
@@ -47,8 +58,27 @@ function saveState() {
   fs.writeFileSync(tmp, JSON.stringify(state, null, 2));
   fs.renameSync(tmp, STATE_FILE);
 }
-// sessions you removed on purpose: a desk window with an older copy of the list can't bring them back
-const removedIds = new Set();
+// sessions you removed on purpose: a desk window with an older copy of the list can't bring them
+// back, not even after the desk restarts (kept on disk, last 500)
+const REMOVED_FILE = path.join(DATA, 'removed.json');
+let removedIds = new Set();
+try { removedIds = new Set(JSON.parse(fs.readFileSync(REMOVED_FILE, 'utf8'))); } catch {}
+function rememberRemoved(ids) {
+  if (!ids.length) return;
+  ids.forEach(id => removedIds.add(id));
+  removedIds = new Set([...removedIds].slice(-500));
+  try { fs.writeFileSync(REMOVED_FILE, JSON.stringify([...removedIds])); } catch {}
+}
+// a save is only taken if it has the right shape; anything else would break every desk window
+const isObj = x => x && typeof x === 'object' && !Array.isArray(x);
+function checkState(next) {
+  if (!isObj(next) || !Array.isArray(next.projects) || !Array.isArray(next.sessions)) return 'bad state';
+  if (!next.projects.length || !next.projects.every(p => isObj(p) && typeof p.id === 'string' && p.id)) return 'bad projects';
+  if (!next.sessions.every(s => isObj(s) && typeof s.id === 'string' && s.id && typeof s.provider === 'string')) return 'bad sessions';
+  if (next.layout != null && !isObj(next.layout)) return 'bad layout';
+  if (next.removed != null && !Array.isArray(next.removed)) return 'bad removed';
+  return null;
+}
 
 // which sessions were running, so a restart of the desk (or of the PC) brings them straight back
 const RUNNING_FILE = path.join(DATA, 'running.json');
@@ -317,20 +347,36 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'PUT' && sameOrigin(req)) {
       try {
         const next = JSON.parse(await readBody(req));
-        if (!Array.isArray(next.projects) || !Array.isArray(next.sessions)) throw new Error('bad state');
+        const bad = checkState(next);
+        if (bad) throw new Error(bad);
         // Only sessions listed in `removed` are stopped and dropped. A session that is simply missing
         // from this copy (another desk window added it a moment ago) is kept: adding a conversation
         // in one window must never stop one that's running.
         const removed = Array.isArray(next.removed) ? next.removed.filter(id => typeof id === 'string') : [];
         delete next.removed;
-        removed.forEach(id => { removedIds.add(id); stopSession(id); });
+        rememberRemoved(removed);
+        removed.forEach(id => stopSession(id));
         const nextIds = new Set(next.sessions.map(s => s.id));
+        // two windows picking a name at the same moment ("Claude Code" twice): number the newcomer
+        const known = new Set(state.sessions.map(s => s.id));
+        let renamed = false;
+        for (const s of next.sessions) {
+          if (known.has(s.id) || !s.autoTitle) continue;
+          const taken = new Set([...state.sessions, ...next.sessions].filter(o => o !== s).map(o => o.title));
+          if (!taken.has(s.title)) continue;
+          const base = String(s.title).replace(/ \d+$/, '');
+          let n = 2; while (taken.has(`${base} ${n}`)) n++;
+          s.title = `${base} ${n}`; renamed = true;
+        }
         const kept = state.sessions.filter(s => !nextIds.has(s.id) && !removedIds.has(s.id));
         next.sessions = next.sessions.filter(s => !removedIds.has(s.id)).concat(kept);
+        // a session filed under a project that no longer exists would vanish from the sidebar while running
+        const pids = new Set(next.projects.map(p => p.id));
+        for (const s of next.sessions) if (!pids.has(s.projectId)) s.projectId = next.projects[0].id;
         state = { ...DEFAULT_STATE, ...next };
         saveState();
         // if the sender's copy was missing something, it gets the full list back too
-        broadcast({ t: 'state', state, from: kept.length ? null : url.searchParams.get('client') });
+        broadcast({ t: 'state', state, from: kept.length || renamed ? null : url.searchParams.get('client') });
         res.writeHead(204); return res.end();
       } catch (err) { res.writeHead(400); return res.end(String(err.message)); }
     }
