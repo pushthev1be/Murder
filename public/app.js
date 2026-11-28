@@ -105,7 +105,8 @@ function onMsg(m) {
       const t = terms.get(m.id);
       if (!t) break;
       t.term.reset();
-      if (m.data) t.term.write(m.data);
+      if (m.data) t.term.write(m.data, () => { t.ready = true; }); // replayed, modes included
+      else t.ready = true;
       t.alive = m.alive;
       updateOverlay(m.id);
       if (m.alive) { t.cols = t.rows = 0; fitTerm(m.id); }
@@ -615,10 +616,27 @@ function sendTextTo(sid, text) {
   }
   if (statuses[sid] === 'stopped' || !statuses[sid]) { toast(`${s.title} isn't running — start it first`); showSession(sid); return; }
   showSession(sid);
-  const t = terms.get(sid);
-  if (t) t.term.paste(text);  // lands as a draft — nothing is sent until you press Enter
-  else send({ t: 'input', id: sid, data: text });
-  toast(`Pasted into ${s.title} as a draft — add your note and press Enter`);
+  // wait until its terminal is up and has replayed its output, so we know how it treats pasted text
+  whenTermReady(sid).then(t => {
+    // Claude Code and modern shells mark pasted text (bracketed paste), so a newline in it isn't
+    // Enter. PowerShell, cmd and others may not: there every line would run as a command right away.
+    // Then the lines are joined into one, so it still only goes when you press Enter.
+    let joined = false;
+    if (!(t && t.term.modes.bracketedPasteMode) && /\n/.test(text)) {
+      text = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean).join(' ');
+      joined = true;
+    }
+    if (t) t.term.paste(text);
+    else send({ t: 'input', id: sid, data: text.replace(/[\r\n]+/g, ' ') });
+    toast(joined ? `Pasted into ${s.title} as one line (so nothing runs before you press Enter)` : `Pasted into ${s.title} as a draft — add your note and press Enter`);
+  });
+}
+function whenTermReady(sid, ms = 3000) {
+  return new Promise(res => {
+    const t0 = Date.now();
+    const tick = () => { const t = terms.get(sid); if (t && t.ready) return res(t); if (Date.now() - t0 > ms) return res(t || null); setTimeout(tick, 50); };
+    tick();
+  });
 }
 
 // ---------- rendering ----------

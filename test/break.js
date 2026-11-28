@@ -708,6 +708,177 @@ fakeTest('cli: Move into desk ends the original and continues the same conversat
   } finally { cli.proc.kill(); }
 });
 
+// ---------- round 4: everyday use ----------
+async function addShell(p) { await p.click('#btnNewMore'); await p.click('#menu .mi >> text=Terminal'); await sleep(900); }
+const sessionIds = async desk => (await desk.state()).state.sessions.map(s => s.id);
+async function sees(desk, id, text) {
+  for (let i = 0; i < 40; i++) { if ((await desk.snapshot(id)).data.includes(text)) return true; await sleep(100); }
+  return false;
+}
+
+test('keys: Ctrl+Alt+Enter inside a terminal expands, and again restores', async ({ desk, browser }) => {
+  const p = await page(browser, desk);
+  await addShell(p); await addShell(p);
+  await p.keyboard.press('Control+Alt+Enter'); await sleep(400);
+  assert(await p.locator('#layoutRoot .pane').count() === 1, 'did not expand');
+  await p.keyboard.press('Control+Alt+Enter'); await sleep(400);
+  assert(await p.locator('#layoutRoot .pane').count() === 2, 'did not restore');
+});
+
+test('keys: Ctrl+Alt+arrows move between panes and typing follows', async ({ desk, browser }) => {
+  const p = await page(browser, desk);
+  await addShell(p); await addShell(p);
+  const [a, b] = await sessionIds(desk);
+  await p.keyboard.press('Control+Alt+ArrowLeft'); await sleep(300);
+  await p.keyboard.type('echo LEFT-$((1+1))\n');
+  await p.keyboard.press('Control+Alt+ArrowRight'); await sleep(300);
+  await p.keyboard.type('echo RIGHT-$((2+2))\n');
+  assert(await sees(desk, a, 'LEFT-2'), 'left pane did not get its text');
+  assert(await sees(desk, b, 'RIGHT-4'), 'right pane did not get its text');
+  assert(!(await desk.snapshot(a)).data.includes('RIGHT-4'), 'text went to the wrong pane');
+});
+
+test('reload: layout, sizes, background and output all come back', async ({ desk, browser }) => {
+  const p = await page(browser, desk);
+  await addShell(p); await addShell(p);
+  const [a] = await sessionIds(desk);
+  await p.click(`.pane[data-sid="${a}"] .pane-body`); await p.keyboard.type('echo RELOAD-$((7*6))\n'); await sleep(400);
+  const div = await p.locator('.divider').first().boundingBox();
+  await p.mouse.move(div.x + div.width / 2, div.y + 50); await p.mouse.down(); await p.mouse.move(div.x - 250, div.y + 50, { steps: 8 }); await p.mouse.up();
+  await p.click('.swatch[data-ground=ember]'); await sleep(600);
+  const w1 = (await bodyRect(p, a)).w;
+  await p.reload(); await p.waitForSelector('#sessionList'); await sleep(1500);
+  const w2 = (await bodyRect(p, a)).w;
+  assert(Math.abs(w1 - w2) < 3, `pane width changed after reload: ${w1} -> ${w2}`);
+  assert(await p.evaluate(() => document.documentElement.dataset.ground) === 'ember', 'background not kept');
+  const txt = await p.evaluate(sid => { const t = document.querySelector(`.pane[data-sid="${sid}"] .xterm-rows`); return t ? t.innerText : null; }, a);
+  assert(txt === null || txt.includes('RELOAD-42'), 'output missing after reload');
+  assert(!(await p.locator('.overlay').count()), 'a pane says it is not running after reload');
+});
+
+test('layout: a divider can not squash a pane below the minimum', async ({ desk, browser }) => {
+  const p = await page(browser, desk);
+  await addShell(p); await addShell(p);
+  const div = await p.locator('.divider').first().boundingBox();
+  await p.mouse.move(div.x + div.width / 2, div.y + 50); await p.mouse.down(); await p.mouse.move(5, div.y + 50, { steps: 10 }); await p.mouse.up();
+  await sleep(300);
+  const ws = await p.$$eval('.pane', els => els.map(e => Math.round(e.getBoundingClientRect().width)));
+  assert(ws.every(w => w >= 299), 'pane squashed: ' + ws);
+});
+
+async function selectAndSend(p, desk, from, to, rows) {
+  const box = await p.locator(`.pane[data-sid="${from}"] .xterm-screen`).boundingBox();
+  const lh = await p.$eval(`.pane[data-sid="${from}"] .xterm-screen`, e => e.getBoundingClientRect().height) / 24;
+  await p.mouse.move(box.x + 1, box.y + lh * rows[0] + lh / 2); await p.mouse.down();
+  await p.mouse.move(box.x + box.width - 3, box.y + lh * rows[1] + lh / 2, { steps: 5 }); await p.mouse.up();
+  await sleep(300);
+  const btn = p.locator(`.pane[data-sid="${from}"] .send-btn:not(.hidden)`);
+  if (!(await btn.count())) return false;
+  await btn.click();
+  await p.click(`#menu .mi >> text=${(await desk.state()).state.sessions.find(s => s.id === to).title}`);
+  await sleep(1000);
+  return true;
+}
+for (const multi of [false, true]) test(`send selection: ${multi ? 'several lines' : 'one line'} land as a draft and nothing runs`, async ({ desk, browser }) => {
+  const p = await page(browser, desk);
+  await addShell(p); await addShell(p);
+  const [a, b] = await sessionIds(desk);
+  await p.click(`.pane[data-sid="${a}"] .pane-body`);
+  // pane a shows two command-looking lines (as agent output often does)
+  await p.keyboard.type("clear; printf 'echo RAN-$((5*5))\\necho RAN-$((6*6))\\n'\n"); await sleep(700);
+  assert(await selectAndSend(p, desk, a, b, multi ? [0, 1] : [0, 0]), 'no "Send selection" button after selecting text');
+  const plain = (await desk.snapshot(b)).data.replace(/\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07/g, '');
+  assert(plain.includes('RAN-$((5'), 'selection never arrived: ' + JSON.stringify(plain.slice(-200)));
+  assert(!/RAN-25|RAN-36/.test(plain), 'the shell RAN the sent text: it was supposed to wait for Enter');
+});
+
+for (const how of ['parked', 'no-bracketed-paste']) test(`send selection: into a ${how} shell nothing runs`, async ({ desk, browser }) => {
+  const p = await page(browser, desk);
+  await addShell(p); await addShell(p);
+  const [a, b] = await sessionIds(desk);
+  await p.click(`.pane[data-sid="${b}"] .pane-body`);
+  // like PowerShell or cmd: a shell that doesn't mark pasted text, so a newline in it means Enter
+  if (how === 'no-bracketed-paste') { await p.keyboard.type("bind 'set enable-bracketed-paste off'\n"); await sleep(400); }
+  await p.click(`.pane[data-sid="${a}"] .pane-body`);
+  await p.keyboard.type("clear; printf 'echo RAN-$((5*5))\\necho RAN-$((6*6))\\n'\n"); await sleep(700);
+  if (how === 'parked') { await p.click(`.pane[data-sid="${b}"] .icon-btn[title^="Park"]`); await sleep(300); }
+  assert(await selectAndSend(p, desk, a, b, [0, 1]), 'no "Send selection" button');
+  await sleep(500);
+  const plain = (await desk.snapshot(b)).data.replace(/\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07/g, '');
+  assert(plain.includes('RAN-$((5'), 'selection never arrived');
+  assert(!/RAN-25|RAN-36/.test(plain), 'the shell RAN the sent text instead of waiting for Enter');
+});
+
+test('park all, then Arrange all brings everything back', async ({ desk, browser }) => {
+  const p = await page(browser, desk);
+  await addShell(p); await addShell(p); await addShell(p);
+  await p.click('#btnParkAll'); await sleep(400);
+  assert(!(await p.locator('#layoutRoot .pane').count()), 'Park all left panes');
+  const st = await desk.state();
+  assert(st.state.sessions.every(s => running(st.statuses[s.id])), 'Park all stopped something');
+  await p.click('#btnTile'); await sleep(800);
+  assert(await p.locator('#layoutRoot .pane').count() === 3, 'Arrange all did not bring all three back');
+});
+
+test('a session that exits offers to start again, and starting works', async ({ desk, browser }) => {
+  const p = await page(browser, desk);
+  await addShell(p);
+  const [a] = await sessionIds(desk);
+  await p.keyboard.type('exit\n'); await sleep(1000);
+  const btn = p.locator(`.pane[data-sid="${a}"] .overlay button`).last();
+  assert(await btn.count(), 'no way to start it again');
+  await btn.click(); await sleep(1000);
+  assert(running((await desk.state()).statuses[a]), 'did not start again');
+  await p.keyboard.type('echo AGAIN-$((8+8))\n');
+  assert(await sees(desk, a, 'AGAIN-16'), 'cannot type after starting again');
+});
+
+test('removing the pane you are typing in does not send keys anywhere else', async ({ desk, browser }) => {
+  const p = await page(browser, desk);
+  await addShell(p); await addShell(p);
+  const [a, b] = await sessionIds(desk);
+  await p.click(`.pane[data-sid="${b}"] .pane-body`);
+  await p.click(`.pane[data-sid="${b}"] .icon-btn[title="More"]`); await p.click('#menu .mi >> text=Remove from desk'); await sleep(600);
+  await p.keyboard.type('echo STRAY-$((3+4))\n'); await sleep(600);
+  assert(!(await desk.snapshot(a)).data.includes('STRAY-7'), 'keys meant for the removed pane went into another session');
+  assert(!p.errors.length, p.errors.join('; '));
+});
+
+test('projects: deleting one that has conversations is refused; moving works', async ({ desk, browser }) => {
+  const st0 = await desk.state();
+  await desk.put({ ...st0.state, projects: [...st0.state.projects, { id: 'p2', name: 'Website', cwd: os.homedir(), collapsed: false }] });
+  const p = await page(browser, desk);
+  await addShell(p);
+  const [a] = await sessionIds(desk);
+  await p.click(`.item[data-sid="${a}"]`, { button: 'right' }); await p.click('#menu .mi >> text=Website'); await sleep(500);
+  assert((await desk.state()).state.sessions[0].projectId === 'p2', 'move to project did not stick');
+  const head = p.locator('.project-head', { hasText: 'Website' });
+  await head.locator('.icon-btn[title="Project options"]').click(); await p.click('#menu .mi >> text=Delete project'); await sleep(400);
+  assert((await desk.state()).state.projects.some(x => x.id === 'p2'), 'a project with conversations was deleted');
+});
+
+fakeTest('snap: closing the desk window puts snapped windows back', async ({ desk, browser }) => {
+  desk.setWindows(CHATGPT);
+  const p = await page(browser, desk); await sleep(3500);
+  await p.click('.item[data-sid="x-win-1001"]'); await waitLayout(desk, l => docked(l, 1001));
+  const n = desk.helperLog().length;
+  await p.close(); await sleep(1500);
+  const after = desk.helperLog().slice(n);
+  assert(after.some(c => c.cmd === 'release' || (c.cmd === 'layout' && !c.items.length)), 'windows left where the closed desk was: ' + after.map(c => c.cmd));
+});
+
+fakeTest('snap: on a zoomed screen (150%) the window still matches its pane', async ({ desk, browser }) => {
+  desk.setWindows(CHATGPT);
+  const p = await browser.newPage({ viewport: { width: 1280, height: 800 }, deviceScaleFactor: 1.5 });
+  p.on('dialog', d => d.accept());
+  await p.goto(desk.url); await p.waitForSelector('#sessionList'); await sleep(3500);
+  await p.click('.item[data-sid="x-win-1001"]');
+  const l = await waitLayout(desk, l => docked(l, 1001));
+  const it = docked(l, 1001), r = await bodyRect(p, 'x-win-1001');
+  assert(r.dpr === 1.5, 'zoom not applied');
+  assert(Math.abs(it.w - r.w * 1.5) <= 1 && Math.abs(it.x - r.x * 1.5) <= 1, `scaled wrong: ${JSON.stringify(it)} vs ${JSON.stringify(r)}`);
+});
+
 // ---------- runner ----------
 (async () => {
   const only = process.argv[2];
