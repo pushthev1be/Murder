@@ -56,9 +56,12 @@ const paneEls = new Map();   // sid -> pane element (kept across re-renders)
 
 // ---------- server sync ----------
 let saveTimer = null;
+const removedQueue = new Set(); // conversations you removed: the server stops them on the next save
 function saveNow() {
   clearTimeout(saveTimer); saveTimer = null;
-  return fetch('/api/state?client=' + CLIENT, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(state) })
+  const removed = [...removedQueue];
+  return fetch('/api/state?client=' + CLIENT, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...state, removed }) })
+    .then(r => { if (r.ok) removed.forEach(id => removedQueue.delete(id)); })
     .catch(() => toast('Could not save layout'));
 }
 function save() {
@@ -297,12 +300,12 @@ function toggleMax(sid) {
   state.maximized = state.maximized === sid ? null : sid;
   commit(); focusPane(sid);
 }
-function startSess(sid, resume = false) {
+function startSess(sid, resume = false, restart = false) {
   const ss = session(sid); if (ss) ss.hasRun = true;
   const t = terms.get(sid);
   const dims = t ? t.fit.proposeDimensions() : null;
   // make sure the server knows about this session before asking it to start
-  saveNow().then(() => send({ t: 'start', id: sid, resume, cols: dims?.cols || 100, rows: dims?.rows || 30 }));
+  saveNow().then(() => send({ t: 'start', id: sid, resume, restart, cols: dims?.cols || 100, rows: dims?.rows || 30 }));
   if (t) { t.term.reset(); t.alive = true; t.cols = t.rows = 0; updateOverlay(sid); setTimeout(() => { fitTerm(sid); t.term.focus(); }, 50); }
 }
 function removeSession(sid) {
@@ -313,6 +316,7 @@ function removeSession(sid) {
   if (running && !confirm(`"${s.title}" is still running. Stop it and remove it from the desk?`)) return;
   removeFromTree(sid); disposeTerm(sid);
   state.sessions = state.sessions.filter(x => x.id !== sid);
+  removedQueue.add(sid);
   commit();
 }
 // ---------- outside sessions ----------
@@ -639,7 +643,10 @@ function renderSidebar() {
     id: EXT_GROUP, name: 'Running elsewhere', collapsed: state.extCollapsed, icon: ICONS.front,
     title: 'Found automatically: Claude Code sessions in other terminals, and ChatGPT / Claude / Codex windows',
     onToggle: () => { state.extCollapsed = !state.extCollapsed; commit(); },
-    tools: [], ids: unassigned, empty: 'Nothing else running',
+    tools: unassigned.some(id => ext(id) && !on.includes(id))
+      ? [h('button', { class: 'icon-btn', title: 'Put all of these on screen', html: ICONS.plus, onclick: () => { unassigned.filter(id => ext(id)).forEach(addToScreen); commit(); } })]
+      : [],
+    ids: unassigned, empty: 'Nothing else running',
   }));
   for (const p of state.projects) {
     const ids = [...state.sessions.filter(s => s.projectId === p.id).map(s => s.id), ...extIds.filter(id => extProject(info(id)) === p.id)];
@@ -647,7 +654,7 @@ function renderSidebar() {
       id: p.id, name: p.name, collapsed: p.collapsed, title: p.cwd, icon: ICONS.folder,
       onToggle: () => { p.collapsed = !p.collapsed; commit(); },
       tools: [
-        h('button', { class: 'icon-btn', title: `New conversation in ${p.name}`, html: ICONS.plus, onclick: () => openNewSession(p.id) }),
+        h('button', { class: 'icon-btn', title: `New conversation in ${p.name}`, html: ICONS.plus, onclick: e => newMenu(e.currentTarget, p.id) }),
         h('button', { class: 'icon-btn', title: 'Project options', html: ICONS.more, onclick: e => projectMenu(p, e.currentTarget) }),
       ],
       ids, empty: 'No conversations yet — drag one here',
@@ -845,9 +852,8 @@ function buildExtPane(sid) {
       h('div', { class: 'tx' }, h('div', { class: 'muted tx-empty' }, 'Loading conversation…')),
       h('div', { class: 'tx-foot' },
         h('span', { class: 'muted' }, `Live view of the session in ${d.where}${d.cwd ? ' · ' + shortPath(d.cwd) : ''}. To reply:`),
-        d.hwnd ? h('button', { class: 'btn', onclick: () => setDock(sid, true) }, 'Snap its window here') : null,
-        d.hwnd ? h('button', { class: 'btn ghost', onclick: () => bringToFront(sid) }, 'Bring to front') : null,
-        h('button', { class: 'btn primary', title: 'Close it there and reopen the same conversation inside the desk', onclick: () => continueHere(sid, true) }, 'Move into desk'))));
+        d.hwnd ? h('button', { class: 'btn primary', title: 'Put its real window in this pane. It keeps running where it is.', onclick: () => setDock(sid, true) }, 'Reply here (snap its window)') : null,
+        h('button', { class: d.hwnd ? 'btn ghost' : 'btn primary', title: `Ends it in ${d.where} and reopens the same conversation inside the desk`, onclick: () => continueHere(sid, true) }, 'Move into desk (closes it there)'))));
     txState.delete(sid);
     requestAnimationFrame(() => loadTranscript(sid, d.sessionId, pane));
   } else {
@@ -985,7 +991,7 @@ function extMenu(sid, anchor) {
     items.push(docksWindow(sid) ? { label: 'Unsnap (put the window back)', act: () => setDock(sid, false) } : { label: 'Snap window into pane', act: () => { addToScreen(sid); setDock(sid, true); } });
     if (d.kind === 'cli' && docksWindow(sid)) items.push({ label: 'Show live transcript instead', act: () => setDock(sid, false) });
   }
-  if (d.kind === 'cli') items.push(d.gone ? { label: 'Resume it here', act: () => continueHere(sid, false) } : { label: 'Move into desk (close it there)', act: () => continueHere(sid, true) });
+  if (d.kind === 'cli') items.push(d.gone ? { label: 'Resume it here', act: () => continueHere(sid, false) } : { label: `Move into desk (closes it in ${d.where})`, act: () => continueHere(sid, true) });
   items.push({ sep: true }, { hdr: 'File under project' });
   state.projects.forEach(p => items.push({ label: (state.extAssign[sid] === p.id ? '✓ ' : '') + p.name, act: () => { moveToProject(sid, p.id); commit(); } }));
   if (state.extAssign[sid]) items.push({ label: 'Back to "Running elsewhere"', act: () => { moveToProject(sid, EXT_GROUP); commit(); } });
@@ -1007,8 +1013,8 @@ function sessionMenu(sid, anchor) {
     items.push({ label: 'Change link…', act: () => { const u = prompt('Chat link', s.url || ''); if (u) { s.url = u.trim(); commit(); } } });
   } else {
     if (st && st !== 'stopped') items.push({ label: 'Stop', act: () => send({ t: 'stop', id: sid }) });
-    if ((s.provider === 'claude' || s.provider === 'codex') && !s.command) items.push({ label: 'Restart & resume last conversation', act: () => { showSession(sid); setTimeout(() => startSess(sid, true), 80); } });
-    items.push({ label: st && st !== 'stopped' ? 'Restart fresh' : 'Start', act: () => { showSession(sid); setTimeout(() => startSess(sid, false), 80); } });
+    if ((s.provider === 'claude' || s.provider === 'codex') && !s.command) items.push({ label: 'Restart & resume last conversation', act: () => { showSession(sid); setTimeout(() => startSess(sid, true, true), 80); } });
+    items.push({ label: st && st !== 'stopped' ? 'Restart fresh' : 'Start', act: () => { showSession(sid); setTimeout(() => startSess(sid, false, true), 80); } });
   }
   const others = state.projects.filter(p => p.id !== s.projectId);
   if (others.length) { items.push({ sep: true }, { hdr: 'Move to project' }); others.forEach(p => items.push({ label: p.name, act: () => { s.projectId = p.id; commit(); } })); }
@@ -1031,6 +1037,44 @@ function projectMenu(p, anchor) {
     if (sess.length) return toast('Move or remove its conversations first');
     state.projects = state.projects.filter(x => x.id !== p.id); commit(); } });
   showMenu(anchor, items);
+}
+
+// ---------- new conversations ----------
+// One click: Claude Code, Codex or a terminal starts right away in the project's folder, with a name
+// picked for you. The dialog is only for the rest (custom command, web chat, another folder).
+const QUICK = ['claude', 'codex', 'shell'];
+function autoTitle(provider) {
+  const base = LABEL[provider], taken = new Set(state.sessions.map(s => s.title));
+  if (!taken.has(base)) return base;
+  for (let n = 2; ; n++) if (!taken.has(`${base} ${n}`)) return `${base} ${n}`;
+}
+function currentProject() {
+  const pid = focusedId && (session(focusedId)?.projectId || state.extAssign[focusedId]);
+  return project(pid) ? pid : state.projects[0].id;
+}
+function createSession({ provider, projectId, title, cwd, command, url }) {
+  const s = {
+    id: uid('s'), title: title || autoTitle(provider), provider, projectId,
+    cwd: provider === 'web' ? null : (cwd || null), command: provider === 'custom' ? command : null,
+    url: provider === 'web' ? url : null, createdAt: Date.now(),
+  };
+  state.sessions.push(s);
+  if (project(projectId)) project(projectId).collapsed = false;
+  addToScreen(s.id);
+  commit();
+  focusPane(s.id, true);
+  if (provider !== 'web') setTimeout(() => startSess(s.id), 150);
+  else openWeb(s);
+}
+function quickAdd(provider, pid) { createSession({ provider, projectId: pid || currentProject() }); }
+function newMenu(anchor, pid) {
+  const p = project(pid || currentProject());
+  showMenu(anchor, [
+    { hdr: `Start now in ${p.name} · ${shortPath(p.cwd)}` },
+    ...QUICK.map(k => ({ label: LABEL[k], act: () => quickAdd(k, p.id) })),
+    { sep: true },
+    { label: 'Other: command, web chat or another folder…', act: () => openNewSession(p.id) },
+  ]);
 }
 
 // ---------- dialogs ----------
@@ -1060,20 +1104,13 @@ function openNewSession(pid) {
 formS.addEventListener('submit', e => {
   if (e.submitter?.value !== 'ok') return;
   const f = formS;
-  const s = {
-    id: uid('s'), title: f.title.value.trim(), provider: f.provider.value, projectId: f.projectId.value,
-    cwd: f.provider.value === 'web' ? null : (f.cwd.value.trim() || null),
-    command: f.provider.value === 'custom' ? f.command.value.trim() : null,
-    url: f.provider.value === 'web' ? f.url.value.trim() : null,
-    createdAt: Date.now(),
-  };
-  state.sessions.push(s);
-  if (project(s.projectId)) project(s.projectId).collapsed = false;
-  addToScreen(s.id);
-  commit();
-  focusPane(s.id, true);
-  if (s.provider !== 'web') setTimeout(() => startSess(s.id), 150);
-  else openWeb(s);
+  const cwd = f.cwd.value.trim();
+  createSession({
+    provider: f.provider.value, projectId: f.projectId.value, title: f.title.value.trim(),
+    // the project's own folder stays "follow the project" rather than a fixed copy
+    cwd: cwd && cwd !== project(f.projectId.value)?.cwd ? cwd : null,
+    command: f.command.value.trim(), url: f.url.value.trim(),
+  });
 });
 async function pickDir(input) {
   const r = await fetch('/api/pickdir', { method: 'POST' }).then(r => r.json()).catch(() => ({}));
@@ -1103,16 +1140,21 @@ formP.addEventListener('submit', e => {
 });
 
 // ---------- top bar ----------
-$('#btnNew').onclick = () => openNewSession();
-$('#btnNewEmpty').onclick = () => openNewSession();
+$('#btnNew').onclick = () => quickAdd('claude');
+$('#btnNewMore').onclick = e => newMenu(e.currentTarget);
+document.querySelectorAll('[data-quick]').forEach(b => b.addEventListener('click', () => b.dataset.quick === 'other' ? openNewSession() : quickAdd(b.dataset.quick)));
 $('#btnNewProject').onclick = () => openProjectDialog();
 $('#btnParkAll').onclick = () => { onScreen().forEach(id => disposeTerm(id)); state.layout = null; state.maximized = null; focusedId = null; commit(); };
+// one click: everything running, in the desk or found elsewhere, tiled on screen
 $('#btnTile').onclick = () => {
-  const running = state.sessions.filter(s => ['working', 'waiting', 'idle'].includes(statuses[s.id]));
-  if (!running.length) return toast('Nothing is running');
+  const running = [
+    ...state.sessions.filter(s => ['working', 'waiting', 'idle'].includes(statuses[s.id])).map(s => s.id),
+    ...discovered.map(d => d.id),
+  ];
+  if (!running.length && !onScreen().length) return toast('Nothing is running');
   const b = stageBox();
   const cols = Math.max(1, Math.floor((b.w + GAP) / (MIN_W + GAP))), rowsMax = Math.max(1, Math.floor((b.h + GAP) / (MIN_H + GAP)));
-  const ids = [...new Set([...onScreen(), ...running.map(s => s.id)])];
+  const ids = [...new Set([...onScreen(), ...running])];
   const shown = ids.slice(0, cols * rowsMax), left = ids.length - shown.length;
   const perRow = Math.min(cols, Math.ceil(Math.sqrt(shown.length * (b.w / b.h) * (MIN_H / MIN_W))) || 1);
   const rows = [];
@@ -1131,7 +1173,7 @@ function globalShortcut(e) {
   const on = onScreen();
   if (e.key === 'Enter' && focusedId && on.includes(focusedId)) { toggleMax(focusedId); return true; }
   if ((e.key === '-' || e.key === '_') && focusedId && on.includes(focusedId)) { park(focusedId); return true; }
-  if (e.key === 'n' || e.key === 'N') { openNewSession(); return true; }
+  if (e.key === 'n' || e.key === 'N') { quickAdd('claude'); return true; }
   const dirs = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] };
   if (dirs[e.key] && on.length) {
     const cur = paneEls.get(focusedId);

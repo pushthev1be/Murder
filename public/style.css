@@ -263,3 +263,11 @@ body.resizing .term-host { pointer-events: none; }
 
 .drop-hint { display: grid; place-items: center; font-size: 13px; font-weight: 600; color: var(--accent); }
 .drop-hint.no { background: rgba(180, 64, 46, .08); border-color: rgba(180, 64, 46, .55); color: var(--danger); }
+
+/* one-click new conversation: main button + a small menu for the other kinds */
+.split-btn { display: inline-flex; }
+.split-btn #btnNew { border-top-right-radius: 0; border-bottom-right-radius: 0; }
+.split-btn .more { border-top-left-radius: 0; border-bottom-left-radius: 0; padding: 6px 7px; border-left: 1px solid rgba(255,255,255,.35); display: inline-flex; align-items: center; }
+.split-btn .more svg { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-width: 2.2; stroke-linecap: round; stroke-linejoin: round; }
+.empty-card .quick { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; margin-bottom: 14px; }
+.empty-card .small { font-size: 12.5px; }

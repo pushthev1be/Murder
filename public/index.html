@@ -21,9 +21,11 @@
           <button class="swatch" data-ground="peach" title="Peach" style="background:linear-gradient(160deg,#fbe9dc,#f6d6c1)"></button>
           <button class="swatch" data-ground="ember" title="Ember (dark)" style="background:#1d1815"></button>
         </div>
-        <button class="btn ghost" id="btnTile" title="Put every running conversation on screen">Show all running</button>
+        <button class="btn ghost" id="btnTile" title="Put everything that's running on screen, side by side, including windows and sessions found elsewhere">Arrange all</button>
         <button class="btn ghost" id="btnParkAll" title="Park everything (sessions keep running)">Park all</button>
-        <button class="btn primary" id="btnNew">+ New conversation</button>
+        <span class="split-btn">
+          <button class="btn primary" id="btnNew" title="Start Claude Code now in the current project's folder (Ctrl+Alt+N)">+ Claude Code</button><button class="btn primary more" id="btnNewMore" title="Codex, a terminal, or something else" aria-label="More kinds"><svg viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></svg></button>
+        </span>
       </div>
     </header>
     <div class="body">
@@ -46,8 +48,14 @@
         <div id="emptyState" class="empty hidden">
           <div class="empty-card">
             <h3>Nothing on screen</h3>
-            <p>Pick a conversation from the left, or start a new one. Drag a conversation onto the edge of a pane to split the screen.</p>
-            <button class="btn primary" id="btnNewEmpty">+ New conversation</button>
+            <p>Start one with a click. It opens in your project's folder and you can type into it right away.</p>
+            <div class="quick">
+              <button class="btn primary" data-quick="claude">Claude Code</button>
+              <button class="btn" data-quick="codex">Codex</button>
+              <button class="btn" data-quick="shell">Terminal</button>
+              <button class="btn ghost" data-quick="other">Other…</button>
+            </div>
+            <p class="muted small">Already running somewhere else? Click <b>Arrange all</b> to bring it in. Drag a conversation onto a pane's edge to split the screen.</p>
           </div>
         </div>
       </main>
@@ -61,7 +69,7 @@
   <dialog id="dlgSession" class="dialog">
     <form method="dialog" id="formSession">
       <h3 id="dlgSessionTitle">New conversation</h3>
-      <label>Name<input name="title" required placeholder="e.g. Implementation" autocomplete="off"></label>
+      <label>Name<input name="title" placeholder="Optional, e.g. Implementation" autocomplete="off"></label>
       <label>Project<select name="projectId" id="selProject"></select></label>
       <fieldset class="kinds" id="kinds">
         <legend>Kind</legend>

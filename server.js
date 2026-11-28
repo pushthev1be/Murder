@@ -47,6 +47,18 @@ function saveState() {
   fs.writeFileSync(tmp, JSON.stringify(state, null, 2));
   fs.renameSync(tmp, STATE_FILE);
 }
+// sessions you removed on purpose: a desk window with an older copy of the list can't bring them back
+const removedIds = new Set();
+
+// which sessions were running, so a restart of the desk (or of the PC) brings them straight back
+const RUNNING_FILE = path.join(DATA, 'running.json');
+let runningIds = new Set();
+try { runningIds = new Set(JSON.parse(fs.readFileSync(RUNNING_FILE, 'utf8'))); } catch {}
+function markRunning(id, on) {
+  if (on === runningIds.has(id)) return;
+  if (on) runningIds.add(id); else runningIds.delete(id);
+  try { fs.writeFileSync(RUNNING_FILE, JSON.stringify([...runningIds])); } catch {}
+}
 
 // ---------- providers ----------
 const PROVIDERS = {
@@ -71,10 +83,12 @@ function shellArgs(command) {
   return args;
 }
 
-function startSession(id, { resume = false, cols = 100, rows = 30 } = {}) {
+function startSession(id, { resume = false, restart = false, cols = 100, rows = 30 } = {}) {
   const s = state.sessions.find(x => x.id === id);
   if (!s || s.provider === 'web') return;
-  stopSession(id);
+  // a running session is only ever restarted when you ask for it (a stray "start" must not kill it)
+  if (live.has(id) && !restart) { broadcastStatus(id, live.get(id).status); return; }
+  stopSession(id, false);
   const p = PROVIDERS[s.provider] || PROVIDERS.custom;
   let command = s.command || p.cmd || '';
   if (resume && p.resume && !s.command) command = p.resume;
@@ -96,6 +110,7 @@ function startSession(id, { resume = false, cols = 100, rows = 30 } = {}) {
   live.set(id, entry);
   s.hasRun = true;
   saveState();
+  markRunning(id, true);
   proc.onData(data => {
     entry.chunks.push(data); entry.size += data.length;
     if (entry.size > SCROLLBACK_LIMIT * 1.5) { // trim to the limit in one go
@@ -111,18 +126,31 @@ function startSession(id, { resume = false, cols = 100, rows = 30 } = {}) {
   proc.onExit(({ exitCode }) => {
     if (live.get(id) !== entry) return;
     live.delete(id);
+    if (!shuttingDown) markRunning(id, false); // it ended by itself (e.g. you typed exit)
     broadcast({ t: 'exit', id, exitCode });
     broadcastStatus(id, 'stopped');
   });
   broadcastStatus(id, 'working');
 }
 
-function stopSession(id) {
+function stopSession(id, forget = true) {
+  if (forget) markRunning(id, false);
   const e = live.get(id);
   if (!e) return;
   live.delete(id);
   try { e.proc.kill(); } catch {}
   broadcastStatus(id, 'stopped');
+}
+let shuttingDown = false;
+
+// bring back what was running last time: Claude Code resumes its exact conversation, Codex its last one
+function resumeRunning() {
+  for (const id of runningIds) {
+    const s = state.sessions.find(x => x.id === id);
+    if (!s || s.provider === 'web') { markRunning(id, false); continue; }
+    try { startSession(id, { resume: true }); }
+    catch (err) { console.error('[resume]', s.title, err.message); markRunning(id, false); }
+  }
 }
 
 function projectCwd(pid) {
@@ -199,7 +227,7 @@ function handleMsg(ws, m) {
       if (e) { e.outAfterIn = 0; e.bell = false; }
       break;
     case 'start':
-      startSession(m.id, { resume: !!m.resume, cols: m.cols, rows: m.rows });
+      startSession(m.id, { resume: !!m.resume, restart: !!m.restart, cols: m.cols, rows: m.rows });
       break;
     case 'stop':
       stopSession(m.id);
@@ -214,9 +242,10 @@ function handleMsg(ws, m) {
       if (ws === dockOwner) discovery.dock(m).then(r => {
         if (r && r.error) {
           // usually the desk window's title (which carries its marker) hasn't updated yet: try again shortly
+          // keep trying (quickly at first, then every few seconds) so a window never stays loose
           ws.dockRetries = (ws.dockRetries || 0) + 1;
-          if (ws.dockRetries <= 8 && ws.readyState === 1) setTimeout(() => ws.readyState === 1 && ws.send(JSON.stringify({ t: 'redock' })), 600);
-          else console.log('[dock]', r.error);
+          if (ws.dockRetries === 9) console.log('[dock]', r.error, '- still retrying');
+          if (ws.readyState === 1) setTimeout(() => ws.readyState === 1 && ws.send(JSON.stringify({ t: 'redock' })), ws.dockRetries <= 8 ? 600 : 3000);
         } else {
           ws.dockRetries = 0;
           if (r && r.minsById && Object.keys(r.minsById).length) ws.send(JSON.stringify({ t: 'mins', mins: r.minsById }));
@@ -289,11 +318,19 @@ const server = http.createServer(async (req, res) => {
       try {
         const next = JSON.parse(await readBody(req));
         if (!Array.isArray(next.projects) || !Array.isArray(next.sessions)) throw new Error('bad state');
-        const removed = state.sessions.filter(s => !next.sessions.some(n => n.id === s.id));
+        // Only sessions listed in `removed` are stopped and dropped. A session that is simply missing
+        // from this copy (another desk window added it a moment ago) is kept: adding a conversation
+        // in one window must never stop one that's running.
+        const removed = Array.isArray(next.removed) ? next.removed.filter(id => typeof id === 'string') : [];
+        delete next.removed;
+        removed.forEach(id => { removedIds.add(id); stopSession(id); });
+        const nextIds = new Set(next.sessions.map(s => s.id));
+        const kept = state.sessions.filter(s => !nextIds.has(s.id) && !removedIds.has(s.id));
+        next.sessions = next.sessions.filter(s => !removedIds.has(s.id)).concat(kept);
         state = { ...DEFAULT_STATE, ...next };
-        removed.forEach(s => stopSession(s.id));
         saveState();
-        broadcast({ t: 'state', state, from: url.searchParams.get('client') });
+        // if the sender's copy was missing something, it gets the full list back too
+        broadcast({ t: 'state', state, from: kept.length ? null : url.searchParams.get('client') });
         res.writeHead(204); return res.end();
       } catch (err) { res.writeHead(400); return res.end(String(err.message)); }
     }
@@ -309,6 +346,7 @@ const server = http.createServer(async (req, res) => {
     } catch { res.writeHead(400); return res.end(); }
   }
   if (url.pathname === '/api/shutdown' && req.method === 'POST' && !req.headers.origin) { // stop.cmd: hand windows back, then exit
+    shuttingDown = true; // what's running now comes back on the next start
     res.writeHead(204); res.end();
     Promise.race([discovery.release(), new Promise(r => setTimeout(r, 2000))]).then(() => process.exit(0));
     return;
@@ -397,10 +435,11 @@ server.on('error', err => {
 });
 server.listen(PORT, '127.0.0.1', () => {
   console.log(`Session Desk running at ${APP_URL}`);
+  resumeRunning();
   console.log('Closing the window does NOT stop your sessions. Close this console to stop everything.');
   // open a window only if no desk window already open reconnects (avoids piling up windows on restart)
   if (!process.argv.includes('--no-open')) setTimeout(() => { if (!clients.size) openAppWindow(APP_URL); }, 4000);
 });
 
-process.on('exit', () => { discovery.close(); for (const e of live.values()) try { e.proc.kill(); } catch {} });
+process.on('exit', () => { shuttingDown = true; discovery.close(); for (const e of live.values()) try { e.proc.kill(); } catch {} });
 process.on('SIGINT', () => process.exit(0));

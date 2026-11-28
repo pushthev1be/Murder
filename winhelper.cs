@@ -5,7 +5,8 @@
 //   layout {items:[{hwnd,x,y,w,h}], park:[hwnd], hidden, marker}
 //          SNAPS each window over its pane: the window stays a normal top-level window of its own
 //          program (so the desk can never close it, and typing works as usual), and the helper keeps
-//          it sized to the pane, moving, minimizing and rising with the desk window.
+//          it sized to the pane, moving, minimizing and rising with the desk window. If the app moves,
+//          resizes, maximizes or minimizes the window itself (or you drag it), it's put back in its pane.
 //   release                   -> put every snapped window back where it was
 // If stdin closes or the desk window disappears, every window is put back.
 using System;
@@ -59,7 +60,11 @@ static class W {
   [DllImport("kernel32.dll")] public static extern bool CloseHandle(IntPtr h);
 }
 
-class Snapped { public W.RECT Orig; public bool WasMin, WasMax; public int X, Y, Wd, Ht, MinW, MinH; public string Applied = ""; }
+class Snapped {
+  public W.RECT Orig; public bool WasMin, WasMax; public int X, Y, Wd, Ht, MinW, MinH; public string Applied = "";
+  public W.RECT Got; public bool HaveGot, Moving; // where the window really ended up last time we placed it
+  public int FixStart, Fixes;                     // to stop fighting an app that keeps resizing itself
+}
 
 static class Program {
   static readonly object gate = new object();
@@ -69,8 +74,10 @@ static class Program {
   static bool hidden = false, deskMin = false;
   static readonly JavaScriptSerializer json = new JavaScriptSerializer { MaxJsonLength = int.MaxValue };
   static W.WinEventProc hookProc; // kept alive for the hooks
-  static uint hookThread;
+  static Timer fixTimer;          // puts windows back shortly after an app moved one of them
   const uint NOSIZE = 0x1, NOMOVE = 0x2, NOZORDER = 0x4, NOACTIVATE = 0x10, SHOWWINDOW = 0x40, NOOWNERZORDER = 0x200;
+
+  static bool Same(W.RECT a, W.RECT b) { return a.L == b.L && a.T == b.T && a.R == b.R && a.B == b.B; }
 
   static string Title(IntPtr h) {
     int len = W.GetWindowTextLength(h); if (len == 0) return "";
@@ -97,9 +104,19 @@ static class Program {
   }
 
   static IntPtr FindDesk(string m) {
-    IntPtr found = IntPtr.Zero;
-    W.EnumWindows((h, l) => { if (W.IsWindowVisible(h) && Title(h).Contains(m)) { found = h; return false; } return true; }, IntPtr.Zero);
-    return found;
+    IntPtr found = IntPtr.Zero, only = IntPtr.Zero; int desks = 0;
+    W.EnumWindows((h, l) => {
+      if (!W.IsWindowVisible(h)) return true;
+      string t = Title(h);
+      if (t.Contains(m)) { found = h; return false; }
+      if (t.Contains("Session Desk")) {
+        var c = new StringBuilder(64); W.GetClassName(h, c, 64);
+        if (c.ToString() == "Chrome_WidgetWin_1") { desks++; only = h; }
+      }
+      return true;
+    }, IntPtr.Zero);
+    // the browser can drop the invisible marker from the title: with a single desk window open, use it
+    return found != IntPtr.Zero ? found : desks == 1 ? only : IntPtr.Zero;
   }
 
   // screen position of the web page's top-left corner inside the desk window
@@ -172,21 +189,54 @@ static class Program {
       var s = snapped[k];
       if (hidden) { // tuck it right behind the desk (still a normal window, never hidden)
         W.SetWindowPos(h, desk, 0, 0, 0, 0, NOMOVE | NOSIZE | NOACTIVATE | NOOWNERZORDER);
-        s.Applied = "behind"; continue;
+        s.Applied = "behind"; s.HaveGot = false; continue;
       }
+      if (s.Moving) continue; // you're dragging it: put it back when you let go
       if (W.IsIconic(h) || W.IsZoomed(h)) { W.ShowWindow(h, 4); s.Applied = ""; }
       var b = Borders(h);
       int x = o.X + s.X - b.L, y = o.Y + s.Y - b.T, w = s.Wd + b.L + b.R, ht = s.Ht + b.T + b.B;
       string want = x + "," + y + "," + w + "," + ht;
-      if (want != s.Applied) {
+      // compare with where the window really is, not only with what we last asked for: apps like
+      // ChatGPT move or resize themselves, and then the window would float over the desk, outside its pane
+      W.RECT now; W.GetWindowRect(h, out now);
+      if (want != s.Applied || !s.HaveGot || !Same(now, s.Got)) {
         W.SetWindowPos(h, IntPtr.Zero, x, y, w, ht, NOZORDER | NOACTIVATE); s.Applied = want;
-        // some apps (ChatGPT, Claude...) have a minimum size and stay bigger than asked: remember it
         W.RECT got; W.GetWindowRect(h, out got);
-        int gw = got.R - got.L - b.L - b.R, gh = got.B - got.T - b.T - b.B;
-        if (gw > s.Wd + 2) s.MinW = Math.Max(s.MinW, gw);
-        if (gh > s.Ht + 2) s.MinH = Math.Max(s.MinH, gh);
+        s.Got = got; s.HaveGot = true;
+        Measure(s, got, b);
       }
       if (raise) W.SetWindowPos(h, IntPtr.Zero, 0, 0, 0, 0, NOMOVE | NOSIZE | NOACTIVATE | NOOWNERZORDER);
+    }
+  }
+
+  // some apps (ChatGPT, Claude...) have a minimum size and stay bigger than asked: remember it
+  static void Measure(Snapped s, W.RECT got, W.RECT b) {
+    int gw = got.R - got.L - b.L - b.R, gh = got.B - got.T - b.T - b.B;
+    if (gw > s.Wd + 2) s.MinW = Math.Max(s.MinW, gw);
+    if (gh > s.Ht + 2) s.MinH = Math.Max(s.MinH, gh);
+  }
+
+  // a snapped window moved or resized on its own: put it back, unless the app keeps insisting
+  // (then accept its size, so we never end up flickering against it)
+  static void FixSnapped() {
+    lock (gate) {
+      try {
+        if (snapped.Count == 0 || !W.IsWindow(desk) || hidden) return;
+        int now = Environment.TickCount;
+        foreach (var kv in snapped) {
+          var s = kv.Value; var h = new IntPtr(kv.Key);
+          if (!s.HaveGot || s.Moving || !W.IsWindow(h)) continue;
+          W.RECT r; W.GetWindowRect(h, out r);
+          if (Same(r, s.Got) && !W.IsIconic(h) && !W.IsZoomed(h)) continue;
+          if (now - s.FixStart > 3000) { s.FixStart = now; s.Fixes = 0; }
+          if (++s.Fixes > 6 && !W.IsIconic(h) && !W.IsZoomed(h)) { // it keeps changing itself: leave it be until the next layout
+            s.Got = r; Measure(s, r, Borders(h));
+            continue;
+          }
+          s.HaveGot = false;
+        }
+        PlaceAll(false);
+      } catch { }
     }
   }
 
@@ -245,7 +295,18 @@ static class Program {
 
   // Windows tells us right away when the desk moves, is minimized/restored, or comes to the front.
   static void OnWinEvent(IntPtr hook, uint ev, IntPtr hwnd, int obj, int child, uint thread, uint time) {
-    if (obj != 0 || hwnd != desk || hwnd == IntPtr.Zero) return; // only the desk window itself matters
+    if (obj != 0 || hwnd == IntPtr.Zero) return;
+    if (hwnd != desk) { // one of the snapped windows changed by itself
+      lock (gate) {
+        Snapped s; if (!snapped.TryGetValue(hwnd.ToInt64(), out s)) return;
+        if (ev == 0x000A) { s.Moving = true; return; }        // EVENT_SYSTEM_MOVESIZESTART: you're dragging it
+        if (ev == 0x000B) s.Moving = false;                    // EVENT_SYSTEM_MOVESIZEEND
+        else if (ev != 0x800B && ev != 0x0016 && ev != 0x0017) return;
+        if (s.Moving) return;
+      }
+      fixTimer.Change(150, Timeout.Infinite); // a moment later, so a burst of changes is fixed once
+      return;
+    }
     lock (gate) {
       if (snapped.Count == 0) return;
       try {
@@ -257,9 +318,9 @@ static class Program {
   }
 
   static void HookThread() {
-    hookThread = W.GetCurrentThreadId();
     hookProc = OnWinEvent;
     W.SetWinEventHook(0x0003, 0x0003, IntPtr.Zero, hookProc, 0, 0, 0x0002 /*OUTOFCONTEXT|SKIPOWNPROCESS*/);
+    W.SetWinEventHook(0x000A, 0x000B, IntPtr.Zero, hookProc, 0, 0, 0x0002); // move/size start + end
     W.SetWinEventHook(0x0016, 0x0017, IntPtr.Zero, hookProc, 0, 0, 0x0002);
     W.SetWinEventHook(0x800B, 0x800B, IntPtr.Zero, hookProc, 0, 0, 0x0002);
     W.MSG msg;
@@ -270,6 +331,7 @@ static class Program {
     try { W.SetProcessDpiAwarenessContext(new IntPtr(-4)); } catch { }
     var stdin = new System.IO.StreamReader(Console.OpenStandardInput(), new UTF8Encoding(false));
     var stdout = new System.IO.StreamWriter(Console.OpenStandardOutput(), new UTF8Encoding(false)) { AutoFlush = true };
+    fixTimer = new Timer(_ => FixSnapped(), null, Timeout.Infinite, Timeout.Infinite);
     new Thread(HookThread) { IsBackground = true }.Start();
     var lines = new BlockingCollection<string>();
     new Thread(() => { string l; while ((l = stdin.ReadLine()) != null) lines.Add(l); lines.CompleteAdding(); }) { IsBackground = true }.Start();
