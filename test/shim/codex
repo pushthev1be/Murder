@@ -1,0 +1,5 @@
+#!/bin/bash
+# Test-only stand-in for Claude Code (and Codex): says what it was asked to do, then behaves like a shell.
+echo "fake claude $*"
+export PS1='claude$ '
+exec bash --norc --noprofile -i

@@ -58,11 +58,12 @@ const paneEls = new Map();   // sid -> pane element (kept across re-renders)
 let saveTimer = null;
 const removedQueue = new Set(); // conversations you removed: the server stops them on the next save
 let unsaved = false;           // a save failed (desk unreachable): retried on reconnect
+const serverKnown = new Set(); // conversations the desk server has confirmed
 function saveNow() {
   clearTimeout(saveTimer); saveTimer = null;
-  const removed = [...removedQueue];
+  const removed = [...removedQueue], ids = state.sessions.map(s => s.id);
   return fetch('/api/state?client=' + CLIENT, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...state, removed }) })
-    .then(r => { if (!r.ok) throw new Error(r.status); removed.forEach(id => removedQueue.delete(id)); unsaved = false; })
+    .then(r => { if (!r.ok) throw new Error(r.status); removed.forEach(id => removedQueue.delete(id)); ids.forEach(id => serverKnown.add(id)); unsaved = false; })
     .catch(() => { unsaved = true; });
 }
 function save() {
@@ -124,11 +125,17 @@ function onMsg(m) {
       break;
     case 'state':
       if (m.from !== CLIENT) {
-        // keep what this window did that the desk hasn't heard yet: removals, and anything not saved
-        const mine = unsaved ? state.sessions.filter(s => !m.state.sessions.some(o => o.id === s.id)) : [];
+        // keep what this window did that the desk hasn't heard yet: removals, and conversations
+        // added here a moment ago (another window's update must not wipe them before they're saved)
+        const mine = state.sessions.filter(s => !serverKnown.has(s.id) && !m.state.sessions.some(o => o.id === s.id));
+        const mineOn = mine.filter(s => isOn(s.id)).map(s => s.id);
         state = m.state;
+        state.sessions.forEach(s => serverKnown.add(s.id));
         state.sessions = state.sessions.filter(s => !removedQueue.has(s.id)).concat(mine);
-        ensureStateShape(); applyGround(state.ground); render();
+        ensureStateShape(); applyGround(state.ground);
+        mineOn.forEach(addToScreen);
+        if (mine.length) save();
+        render();
       }
       break;
     case 'hello':
@@ -148,7 +155,7 @@ function onMsg(m) {
       lastDockPayload = ''; lastDocked.clear(); syncDock();
       break;
     case 'discovered':
-      setDiscovered(m.items);
+      if (setDiscovered(m.items)) save();
       render();
       break;
     case 'ccmap': {
@@ -288,8 +295,27 @@ function ensureStateShape() {
 }
 function setDiscovered(items) {
   discovered = items;
+  let moved = false;
+  // an app window you had on screen was closed and opened again (that's a new window): it goes
+  // straight back into the same pane, snapped the same way, instead of you setting it up again
+  if (state && state.layout) for (const sid of onScreen()) {
+    const old = lastExt.get(sid);
+    if (!isExt(sid) || items.some(d => d.id === sid) || !old || old.kind !== 'app') continue;
+    const repl = items.find(d => d.kind === 'app' && d.where === old.where && !isOn(d.id) && !lastExt.has(d.id));
+    if (!repl) continue;
+    const walk = n => { if (n.type === 'pane') { if (n.sid === sid) n.sid = repl.id; } else n.children.forEach(walk); };
+    walk(state.layout);
+    if (state.maximized === sid) state.maximized = repl.id;
+    if (sid in state.extDock) state.extDock[repl.id] = state.extDock[sid];
+    if (state.extAssign[sid]) state.extAssign[repl.id] = state.extAssign[sid];
+    delete state.extDock[sid]; delete state.extAssign[sid];
+    lastExt.delete(sid); paneEls.delete(sid); lastDocked.delete(sid);
+    if (focusedId === sid) focusedId = repl.id;
+    moved = true;
+  }
   for (const d of items) { lastExt.set(d.id, d); statuses[d.id] = d.status; }
   for (const id of lastExt.keys()) if (!items.some(d => d.id === id)) statuses[id] = 'gone';
+  return moved;
 }
 
 // ---------- actions ----------
@@ -718,7 +744,7 @@ function renderStage() {
   root.innerHTML = '';
   $('#emptyState').classList.toggle('hidden', on.length > 0);
   $('#stageTitle').textContent = state.maximized ? 'Focused' : 'On screen';
-  if (!state.layout) return;
+  if (!state.layout) { syncDock(); return; } // still tell the helper: snapped windows must leave the empty stage
   if (state.maximized && on.includes(state.maximized)) {
     root.append(cellFor({ type: 'pane', sid: state.maximized }));
   } else {
@@ -1239,6 +1265,7 @@ dlgP.addEventListener('close', () => hideDocked(false));
 // ---------- boot ----------
 fetch('/api/state').then(r => { if (!r.ok) throw new Error(r.status); return r.json(); }).then(d => {
   state = d.state; statuses = d.statuses; home = d.home;
+  state.sessions.forEach(s => serverKnown.add(s.id));
   ensureStateShape();
   applyGround(state.ground);
   setDiscovered(d.discovered || []);

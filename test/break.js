@@ -23,9 +23,19 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 // ---------- a desk server ----------
 class Desk {
-  constructor(data) { this.data = data || fs.mkdtempSync(path.join(os.tmpdir(), 'desk-')); this.port = nextPort++; }
+  constructor(opts = {}) {
+    this.data = fs.mkdtempSync(path.join(os.tmpdir(), 'desk-')); this.port = nextPort++;
+    this.fake = !!opts.fake; // fake windows instead of demo mode: discovery + docking run for real
+    this.fakeFile = path.join(this.data, 'fake-windows.json');
+    this.home = path.join(this.data, 'home');
+  }
+  setWindows(w) { fs.writeFileSync(this.fakeFile, JSON.stringify(w)); }
+  helperLog() { try { return fs.readFileSync(this.fakeFile + '.log', 'utf8').trim().split('\n').filter(Boolean).map(l => JSON.parse(l)); } catch { return []; } }
+  layouts() { return this.helperLog().filter(c => c.cmd === 'layout'); }
   async start() {
-    const env = { ...process.env, DESK_DEMO: '1', DESK_DATA: this.data, DESK_PORT: String(this.port) };
+    const env = { ...process.env, DESK_DATA: this.data, DESK_PORT: String(this.port) };
+    if (this.fake) { env.DESK_FAKE_WINDOWS = this.fakeFile; env.USERPROFILE = this.home; fs.mkdirSync(this.home, { recursive: true }); if (!fs.existsSync(this.fakeFile)) this.setWindows({}); }
+    else env.DESK_DEMO = '1';
     if (process.platform !== 'win32') env.PATH = SHIM + path.delimiter + env.PATH;
     this.proc = spawn(process.execPath, ['server.js', '--no-open'], { cwd: ROOT, env });
     this.log = ''; this.code = undefined;
@@ -514,6 +524,190 @@ test('server: many windows connecting and leaving at once', async ({ desk }) => 
   assert(running(st.statuses.a), 'session hurt by window churn');
 });
 
+test('UI: four windows each adding three at once lose nothing', async ({ desk, browser }) => {
+  const ps = [];
+  for (let i = 0; i < 4; i++) ps.push(await page(browser, desk, { width: 1600, height: 1000 }));
+  await Promise.all(ps.map(async p => { for (let k = 0; k < 3; k++) { await p.click('#btnNew'); await sleep(30); } }));
+  await sleep(3500);
+  const st = await desk.state();
+  const names = st.state.sessions.map(s => s.title);
+  assert(st.state.sessions.length === 12, `expected 12, got ${names.length}: ${names}`);
+  assert(new Set(names).size === 12, 'duplicate names: ' + names);
+  const stopped = st.state.sessions.filter(s => !running(st.statuses[s.id]));
+  assert(!stopped.length, 'never started: ' + stopped.map(s => s.title));
+  for (const p of ps) { const n = await p.locator('#sessionList .item').count(); assert(n === 12, `a window lists ${n} of 12`); }
+});
+
+// ---------- round 3: outside windows and snapping (fake windows, real discovery + docking) ----------
+const fakeTest = (name, fn) => cases.push({ name, fn, fake: true });
+const CHATGPT = { windows: [{ hwnd: 1001, pid: 501, title: 'ChatGPT', min: false }], procs: [[501, 1, 'ChatGPT.exe']] };
+const lastLayout = desk => desk.layouts().slice(-1)[0];
+const docked = (l, hwnd) => l && l.items.find(i => i.hwnd === hwnd);
+async function waitLayout(desk, pred, ms = 6000) {
+  for (let t = 0; t < ms; t += 100) { const l = lastLayout(desk); if (l && pred(l)) return l; await sleep(100); }
+  return lastLayout(desk);
+}
+async function bodyRect(p, sid) {
+  return p.$eval(`.pane[data-sid="${sid}"] .pane-body`, e => { const r = e.getBoundingClientRect(); return { x: r.left, y: r.top, w: r.width, h: r.height, dpr: devicePixelRatio }; });
+}
+// a fake Claude Code CLI session: a real (sleeping) process, its registry entry and a transcript
+function fakeCli(desk, { host = 'WindowsTerminal.exe', hostHwnd = 2002 } = {}) {
+  const proc = spawn('sleep', ['600']);
+  const sid = '11111111-2222-3333-4444-555555555555', hostPid = 777;
+  fs.mkdirSync(path.join(desk.home, '.claude', 'sessions'), { recursive: true });
+  fs.writeFileSync(path.join(desk.home, '.claude', 'sessions', proc.pid + '.json'), JSON.stringify({ pid: proc.pid, sessionId: sid, cwd: desk.home, status: 'idle', statusUpdatedAt: 1 }));
+  fs.mkdirSync(path.join(desk.home, '.claude', 'projects', 'p'), { recursive: true });
+  fs.writeFileSync(path.join(desk.home, '.claude', 'projects', 'p', sid + '.jsonl'),
+    JSON.stringify({ type: 'user', message: { content: 'fix the login bug' } }) + '\n' +
+    JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: 'Looking at auth.js now.' }] } }) + '\n');
+  desk.setWindows({ windows: [{ hwnd: hostHwnd, pid: hostPid, title: 'Terminal', min: false }], procs: [[proc.pid, hostPid, 'claude.exe'], [hostPid, 1, host]] });
+  return { proc, id: 'x-cc-' + sid, alive: () => { try { process.kill(proc.pid, 0); return true; } catch { return false; } } };
+}
+
+fakeTest('snap: a ChatGPT window lands exactly on its pane', async ({ desk, browser }) => {
+  desk.setWindows(CHATGPT);
+  const p = await page(browser, desk); await sleep(3500);
+  await p.click('.item[data-sid="x-win-1001"]');
+  const l = await waitLayout(desk, l => docked(l, 1001));
+  const it = docked(l, 1001), r = await bodyRect(p, 'x-win-1001');
+  assert(it, 'never snapped');
+  const off = Math.max(Math.abs(it.x - r.x * r.dpr), Math.abs(it.y - r.y * r.dpr), Math.abs(it.w - r.w * r.dpr), Math.abs(it.h - r.h * r.dpr));
+  assert(off <= 1, `window off its pane by ${off}px: ${JSON.stringify(it)} vs ${JSON.stringify(r)}`);
+  assert(l.hidden === false, 'snapped window left hidden');
+});
+
+fakeTest('snap: parking the pane minimizes the window, it is not left floating', async ({ desk, browser }) => {
+  desk.setWindows(CHATGPT);
+  const p = await page(browser, desk); await sleep(3500);
+  await p.click('.item[data-sid="x-win-1001"]'); await waitLayout(desk, l => docked(l, 1001));
+  await p.click('.pane[data-sid="x-win-1001"] .icon-btn[title^="Park"]');
+  const l = await waitLayout(desk, l => !docked(l, 1001));
+  assert(!docked(l, 1001) && (l.park || []).includes(1001), 'parked window not minimized: ' + JSON.stringify(l));
+});
+
+fakeTest('snap: expanding another pane tucks the window away, restoring brings it back', async ({ desk, browser }) => {
+  desk.setWindows(CHATGPT);
+  const p = await page(browser, desk); await sleep(3500);
+  await p.click('.item[data-sid="x-win-1001"]'); await waitLayout(desk, l => docked(l, 1001));
+  await p.click('#btnNew'); await sleep(1200);
+  const other = (await desk.state()).state.sessions[0].id;
+  await p.dblclick(`.pane[data-sid="${other}"] .pane-title`);
+  let l = await waitLayout(desk, l => !docked(l, 1001));
+  assert(!docked(l, 1001), 'window still over the stage while another pane is expanded');
+  await p.dblclick(`.pane[data-sid="${other}"] .pane-title`);
+  l = await waitLayout(desk, l => docked(l, 1001));
+  assert(docked(l, 1001), 'window did not come back after restoring the layout');
+});
+
+fakeTest('snap: an open dialog or a drag tucks windows behind the desk', async ({ desk, browser }) => {
+  desk.setWindows(CHATGPT);
+  const p = await page(browser, desk); await sleep(3500);
+  await p.click('.item[data-sid="x-win-1001"]'); await waitLayout(desk, l => docked(l, 1001));
+  await p.click('#btnNewMore'); await p.click('#menu .mi >> text=Other');
+  let l = await waitLayout(desk, l => l.hidden);
+  assert(l.hidden, 'window stays over the dialog');
+  await p.keyboard.press('Escape');
+  l = await waitLayout(desk, l => !l.hidden);
+  assert(!l.hidden && docked(l, 1001), 'window did not come back after the dialog');
+});
+
+fakeTest('snap: a second desk window in the background cannot move the windows', async ({ desk, browser }) => {
+  desk.setWindows(CHATGPT);
+  const a = await page(browser, desk); await sleep(3500);
+  await a.click('.item[data-sid="x-win-1001"]'); await waitLayout(desk, l => docked(l, 1001));
+  const want = await bodyRect(a, 'x-win-1001');
+  const b = await page(browser, desk, { width: 900, height: 600 }); // a different size: its panes are elsewhere
+  await b.evaluate(() => window.dispatchEvent(new Event('resize')));
+  await a.click('.swatch[data-ground=sand]'); // makes b re-render
+  await a.bringToFront(); await a.evaluate(() => window.dispatchEvent(new Event('focus')));
+  await sleep(1500);
+  const it = docked(lastLayout(desk), 1001);
+  assert(it && Math.abs(it.w - want.w * want.dpr) <= 1, `window was moved to the other desk window's pane: ${JSON.stringify(it)} vs ${JSON.stringify(want)}`);
+});
+
+fakeTest('snap: the helper not finding the desk keeps being retried', async ({ desk, browser }) => {
+  desk.setWindows({ ...CHATGPT, layoutReply: { error: 'desk window not found' } });
+  const p = await page(browser, desk); await sleep(3500);
+  await p.click('.item[data-sid="x-win-1001"]');
+  await sleep(9000);
+  const n = desk.layouts().length;
+  desk.setWindows(CHATGPT); // the desk window turns up
+  await sleep(4000);
+  assert(desk.layouts().length > n, 'gave up retrying: a window would stay loose until you touched the layout');
+});
+
+fakeTest('snap: a window that needs more room grows its pane', async ({ desk, browser }) => {
+  desk.setWindows({ ...CHATGPT, mins: [[1001, 700, 500]] });
+  const p = await page(browser, desk); await sleep(3500);
+  await p.click('#btnNew'); await sleep(400); await p.click('#btnNew'); await sleep(400);
+  await p.click('.item[data-sid="x-win-1001"]'); await sleep(2500);
+  const r = await bodyRect(p, 'x-win-1001');
+  assert(r.w >= 699 && r.h >= 499, `pane is ${Math.round(r.w)}x${Math.round(r.h)}, the app needs 700x500, so it spills over its neighbours`);
+});
+
+fakeTest('snap: a ChatGPT title change does not take the keyboard from a terminal', async ({ desk, browser }) => {
+  desk.setWindows(CHATGPT);
+  const p = await page(browser, desk); await sleep(3500);
+  await p.click('.item[data-sid="x-win-1001"]'); await sleep(500);
+  await p.click('#btnNew'); await sleep(1500);
+  const id = (await desk.state()).state.sessions[0].id;
+  await p.click(`.pane[data-sid="${id}"] .pane-body`);
+  await p.keyboard.type('echo TITLE');
+  desk.setWindows({ ...CHATGPT, windows: [{ ...CHATGPT.windows[0], title: 'Fixing a login bug - ChatGPT' }] });
+  await sleep(3800); // next discovery pass
+  await p.keyboard.type('-SAFE-$((9*9))\n');
+  let ok = false;
+  for (let i = 0; i < 30 && !ok; i++) { ok = (await desk.snapshot(id)).data.includes('TITLE-SAFE-81'); await sleep(100); }
+  assert(ok, 'keystrokes lost when the ChatGPT window changed its title');
+});
+
+fakeTest('snap: ChatGPT closed and reopened goes back into its pane', async ({ desk, browser }) => {
+  desk.setWindows(CHATGPT);
+  const p = await page(browser, desk); await sleep(3500);
+  await p.click('.item[data-sid="x-win-1001"]'); await waitLayout(desk, l => docked(l, 1001));
+  desk.setWindows({}); await sleep(3500); // closed
+  desk.setWindows({ windows: [{ hwnd: 1077, pid: 502, title: 'ChatGPT', min: false }], procs: [[502, 1, 'ChatGPT.exe']] }); // reopened: new window
+  const l = await waitLayout(desk, l => docked(l, 1077), 8000);
+  assert(docked(l, 1077), 'the reopened ChatGPT window is not in the pane: you have to set it up again');
+});
+
+fakeTest('cli: putting an outside Claude Code session on screen never stops it', async ({ desk, browser }) => {
+  const cli = fakeCli(desk);
+  try {
+    const p = await page(browser, desk); await sleep(3500);
+    await p.click(`.item[data-sid="${cli.id}"]`); await sleep(1500);
+    await p.click('#btnTile'); await sleep(1000);
+    await p.click(`.pane[data-sid="${cli.id}"] .icon-btn[title^="Park"]`); await sleep(500);
+    assert(cli.alive(), 'the outside Claude Code process was stopped');
+  } finally { cli.proc.kill(); }
+});
+
+fakeTest('cli: in an IDE it shows the conversation, and Reply here snaps without stopping it', async ({ desk, browser }) => {
+  const cli = fakeCli(desk, { host: 'Code.exe', hostHwnd: 3003 });
+  try {
+    const p = await page(browser, desk); await sleep(3500);
+    await p.click(`.item[data-sid="${cli.id}"]`); await sleep(2500);
+    const tx = await p.$eval(`.pane[data-sid="${cli.id}"] .tx`, e => e.innerText).catch(() => '');
+    assert(tx.includes('fix the login bug') && tx.includes('auth.js'), 'transcript not shown: ' + tx.slice(0, 200));
+    await p.click(`.pane[data-sid="${cli.id}"] >> text=Reply here`);
+    const l = await waitLayout(desk, l => docked(l, 3003));
+    assert(docked(l, 3003), 'Reply here did not snap the window');
+    assert(cli.alive(), 'Reply here stopped the original');
+  } finally { cli.proc.kill(); }
+});
+
+fakeTest('cli: Move into desk ends the original and continues the same conversation', async ({ desk, browser }) => {
+  const cli = fakeCli(desk, { host: 'Code.exe', hostHwnd: 3003 });
+  try {
+    const p = await page(browser, desk); await sleep(3500);
+    await p.click(`.item[data-sid="${cli.id}"]`); await sleep(1000);
+    await p.click(`.pane[data-sid="${cli.id}"] >> text=Move into desk`); await sleep(3000);
+    assert(!cli.alive(), 'original still running');
+    const s = (await desk.state()).state.sessions[0];
+    assert(s && s.provider === 'claude' && s.resumeId === '11111111-2222-3333-4444-555555555555', 'not resumed in the desk: ' + JSON.stringify(s));
+  } finally { cli.proc.kill(); }
+});
+
 // ---------- runner ----------
 (async () => {
   const only = process.argv[2];
@@ -521,7 +715,7 @@ test('server: many windows connecting and leaving at once', async ({ desk }) => 
   const browser = await chromium.launch();
   let failed = 0;
   for (const c of list) {
-    const desk = await new Desk().start();
+    const desk = await new Desk({ fake: c.fake }).start();
     const t0 = Date.now();
     try {
       await Promise.race([c.fn({ desk, browser }), sleep(60000).then(() => { throw new Error('timed out'); })]);

@@ -56,6 +56,20 @@ class Helper {
   close() { this.closing = true; try { this.proc.stdin.end(); } catch {} }
 }
 
+// For tests (DESK_FAKE_WINDOWS=<file>): windows and processes come from a JSON file instead of
+// Windows, and every command the desk sends to the helper is appended to <file>.log.
+class FakeHelper {
+  constructor(file) { this.file = file; }
+  async call(cmd, args = {}) {
+    let w = {}; try { w = JSON.parse(fs.readFileSync(this.file, 'utf8')); } catch {}
+    try { fs.appendFileSync(this.file + '.log', JSON.stringify({ cmd, ...args, at: Date.now() }) + '\n'); } catch {}
+    if (cmd === 'list') return { windows: w.windows || [], procs: w.procs || [] };
+    if (cmd === 'layout') return w.layoutReply || { ok: true, mins: w.mins || [] };
+    return true;
+  }
+  close() {}
+}
+
 // ---------- known chat apps ----------
 const APPS = [
   { exe: /^chatgpt\.exe$/i, label: 'ChatGPT app', provider: 'chatgpt' },
@@ -202,7 +216,7 @@ class Discovery {
   constructor({ ownPids, onChange }) {
     this.ownPids = ownPids;      // () => Set of pids of the desk's own ptys
     this.onChange = onChange;
-    this.helper = new Helper();
+    this.helper = process.env.DESK_FAKE_WINDOWS ? new FakeHelper(process.env.DESK_FAKE_WINDOWS) : new Helper();
     this.items = [];
     this.hwndById = new Map();
     this.seenAt = new Map();     // id -> statusUpdatedAt the user has seen
