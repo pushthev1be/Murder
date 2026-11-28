@@ -941,6 +941,79 @@ test('leaks: hundreds of re-renders leave no extra terminals or nodes behind', a
   assert(st.state.sessions.every(s => running(st.statuses[s.id])), 'something stopped');
 });
 
+// ---------- round 6: transcripts, statuses, unsnap, web chats ----------
+const CC = '11111111-2222-3333-4444-555555555555';
+const txFile = desk => path.join(desk.home, '.claude', 'projects', 'p', CC + '.jsonl');
+const regFile = (desk, cli) => path.join(desk.home, '.claude', 'sessions', cli.proc.pid + '.json');
+
+fakeTest('cli: the live view follows new messages', async ({ desk, browser }) => {
+  const cli = fakeCli(desk, { host: 'Code.exe', hostHwnd: 3003 });
+  try {
+    const p = await page(browser, desk); await sleep(3500);
+    await p.click(`.item[data-sid="${cli.id}"]`); await sleep(1500);
+    fs.appendFileSync(txFile(desk), JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: 'Fixed it in NEWLINE-77.' }] } }) + '\n');
+    let ok = false;
+    for (let i = 0; i < 50 && !ok; i++) { ok = (await p.$eval(`.pane[data-sid="${cli.id}"] .tx`, e => e.innerText)).includes('NEWLINE-77'); await sleep(100); }
+    assert(ok, 'new message never showed up');
+  } finally { cli.proc.kill(); }
+});
+
+fakeTest('cli: "needs you" shows when it finishes, and clears once you look', async ({ desk, browser }) => {
+  const cli = fakeCli(desk, { host: 'Code.exe', hostHwnd: 3003 });
+  try {
+    const p = await page(browser, desk); await sleep(3500);
+    const reg = JSON.parse(fs.readFileSync(regFile(desk, cli), 'utf8'));
+    fs.writeFileSync(regFile(desk, cli), JSON.stringify({ ...reg, status: 'idle', statusUpdatedAt: Date.now() }));
+    let st;
+    for (let i = 0; i < 60; i++) { st = await p.$eval(`.item[data-sid="${cli.id}"] .dot`, e => e.className); if (st.includes('waiting')) break; await sleep(100); }
+    assert(st.includes('waiting'), 'did not show "needs you": ' + st);
+    await p.click(`.item[data-sid="${cli.id}"]`);
+    for (let i = 0; i < 60; i++) { st = await p.$eval(`.item[data-sid="${cli.id}"] .dot`, e => e.className); if (!st.includes('waiting')) break; await sleep(100); }
+    assert(!st.includes('waiting'), 'still "needs you" after looking at it');
+  } finally { cli.proc.kill(); }
+});
+
+fakeTest('snap: Unsnap puts the window back where it was (not minimized)', async ({ desk, browser }) => {
+  desk.setWindows(CHATGPT);
+  const p = await page(browser, desk); await sleep(3500);
+  await p.click('.item[data-sid="x-win-1001"]'); await waitLayout(desk, l => docked(l, 1001));
+  await p.click('.pane[data-sid="x-win-1001"] >> text=Unsnap');
+  const l = await waitLayout(desk, l => !docked(l, 1001));
+  assert(!docked(l, 1001), 'still snapped');
+  assert(!(l.park || []).includes(1001), 'unsnapping minimized the window instead of putting it back');
+  assert(await p.locator('.pane[data-sid="x-win-1001"] >> text=Snap it here').count(), 'pane gives no way to snap it again');
+});
+
+fakeTest('outside windows filed under a project: closing it leaves a clean card', async ({ desk, browser }) => {
+  desk.setWindows(CHATGPT);
+  const st0 = await desk.state();
+  await desk.put({ ...st0.state, projects: [...st0.state.projects, { id: 'p2', name: 'Website', cwd: os.homedir(), collapsed: false }] });
+  const p = await page(browser, desk); await sleep(3500);
+  await p.click('.item[data-sid="x-win-1001"]', { button: 'right' }); await p.click('#menu .mi >> text=Website'); await sleep(300);
+  await p.click('.item[data-sid="x-win-1001"]'); await sleep(800);
+  desk.setWindows({}); await sleep(3800);
+  assert(await p.locator('.pane[data-sid="x-win-1001"] >> text=This window has closed').count(), 'no closed card');
+  await p.click('.pane[data-sid="x-win-1001"] >> text=Remove pane'); await sleep(500);
+  assert(!(await p.locator('.pane[data-sid="x-win-1001"]').count()), 'pane not removed');
+  assert(!p.errors.length, p.errors.join('; '));
+});
+
+test('web chat: link opens, scratchpad survives reload, a bad link is refused', async ({ desk, browser }) => {
+  const p = await page(browser, desk);
+  await p.click('#btnNewMore'); await p.click('#menu .mi >> text=Other');
+  await p.check('#formSession input[value=web]', { force: true });
+  await p.fill('#formSession input[name=url]', 'https://chatgpt.com/c/abc');
+  await p.click('#btnSessionOk'); await sleep(800);
+  const id = (await sessionIds(desk))[0];
+  await p.fill(`.pane[data-sid="${id}"] textarea`, 'remember: ask about auth'); await sleep(600);
+  await p.reload(); await p.waitForSelector('#sessionList'); await sleep(800);
+  assert((await p.inputValue(`.pane[data-sid="${id}"] textarea`)) === 'remember: ask about auth', 'scratchpad lost on reload');
+  // a javascript: link must never be opened
+  const r = await p.evaluate(sid => fetch('/api/open', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url: 'javascript:alert(1)' }) }).then(r => r.status), id);
+  assert(r === 400, 'server opened a javascript: link');
+  assert(!p.errors.length, p.errors.join('; '));
+});
+
 // ---------- runner ----------
 (async () => {
   const only = process.argv[2];
